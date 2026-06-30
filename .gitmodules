@@ -1,3 +1,4 @@
 [submodule "third_party/orca_sensor"]
 	path = third_party/orca_sensor
 	url = https://github.com/jjaaeehhoooonn/sensor_readout.git
+	branch = feature/no-tactile-sensor
