@@ -61,6 +61,30 @@ class TaxelReading:
 
 
 @dataclass(frozen=True)
+class JointSensorReading:
+    """Joint angles from a single magnetic-encoder frame.
+
+    ``angles`` holds the configured joint-name → angle (degrees) mapping;
+    ``raw`` holds every sensor channel ordered by sensor id, so unmapped
+    channels remain accessible.
+    """
+
+    angles: dict[str, float]
+    raw: list[float]
+    timestamp: float | None = None
+
+    def __getitem__(self, joint: str) -> float:
+        return self.angles[joint]
+
+    def __contains__(self, joint: str) -> bool:
+        return joint in self.angles
+
+    @property
+    def joints(self) -> list[str]:
+        return list(self.angles.keys())
+
+
+@dataclass(frozen=True)
 class TactileReading:
     """Atomic snapshot of resultant + per-taxel forces from a single frame.
 

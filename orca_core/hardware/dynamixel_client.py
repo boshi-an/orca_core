@@ -35,6 +35,7 @@ PROTOCOL_VERSION = 2.0
 ADDR_ID = 7
 ADDR_BAUD_RATE = 8
 ADDR_OPERATING_MODE = 11
+ADDR_HOMING_OFFSET = 20
 ADDR_TORQUE_ENABLE = 64
 ADDR_GOAL_POSITION = 116
 ADDR_GOAL_PWM = 100
@@ -50,6 +51,7 @@ ADDR_PRESENT_TEMPERATURE = 146
 
 # Data Byte Length
 LEN_OPERATING_MODE = 1
+LEN_HOMING_OFFSET = 4
 LEN_PRESENT_POSITION = 4
 LEN_PRESENT_VELOCITY = 4
 LEN_PRESENT_CURRENT = 2
@@ -216,6 +218,13 @@ class DynamixelClient(MotorClient):
 
         # Clear any pre-existing hardware errors before enabling torque.
         self.check_overload_and_reboot(self.motor_ids)
+
+        # Clear homing offsets (EEPROM, torque must be off). The stack assumes
+        # present position is operating-mode invariant, which a non-zero offset
+        # would break when init_joints switches modes.
+        self.set_torque_enabled(self.motor_ids, False)
+        self.sync_write(self.motor_ids, [0] * len(self.motor_ids),
+                        ADDR_HOMING_OFFSET, LEN_HOMING_OFFSET)
 
         # Start with all motors enabled.
         self.set_torque_enabled(self.motor_ids, True)

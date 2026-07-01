@@ -76,6 +76,11 @@ class BaseHand(ABC):
         """Apply a joint-space command. Return ``True`` if the command was applied."""
         pass
 
+    @abstractmethod
+    def _set_joint_current(self, joint_current: OrcaJointPositions) -> bool:
+        """Apply a joint-space current command. Return ``True`` if the command was applied."""
+        pass
+
     def _coerce_joint_positions(
         self,
         joint_pos: OrcaJointPositions | Mapping[str, float | None] | np.ndarray,
@@ -140,6 +145,25 @@ class BaseHand(ABC):
             self._set_joint_positions(wp)
             if i < len(waypoints) - 1:
                 time.sleep(step_size)
+
+    def set_joint_current(
+        self,
+        joint_current: OrcaJointPositions | Mapping[str, float | None] | np.ndarray,
+    ):
+        """Command the hand to a target joint current configuration.
+
+        Currents are clamped to configured ROM bounds before being sent to
+        the hardware for increased safety.
+
+        Args:
+            joint_current: Target joint currents as an
+                :class:`~orca_core.OrcaJointPosition`, a ``dict``, or a 1-D
+                ``np.ndarray`` aligned with :attr:`joint_ids`.
+
+        """
+        joint_current = self._coerce_joint_positions(joint_current)
+        joint_current = self.config.clamp_joint_currents(joint_current)
+        self._set_joint_current(joint_current)
 
     def get_joint_position(self) -> OrcaJointPositions:
         return self._get_joint_positions()

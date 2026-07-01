@@ -2,6 +2,7 @@ MOTOR_IDS = "motor_ids"
 JOINT_IDS = "joint_ids"
 JOINT_TO_MOTOR_MAP = "joint_to_motor_map"
 JOINT_ROM_DICT = "joint_roms"
+JOINT_CURRENT_DICT = "joint_current_limits"
 JOINT_INVERSION_DICT = "joint_inversion"
 MOTOR_LIMITS_DICT = "motor_limits"
 MOTOR_TO_JOINT_DICT = "motor_to_joint"
@@ -22,6 +23,9 @@ KNOWN_VIDS: dict[str, list[int]] = {
     ],
     "tactile_sensor": [
         0x28E9,  # Paxini tactile sensor USB adapter
+    ],
+    "joint_sensor": [
+        0x16C0,  # PJRC Teensy (magnetic-encoder joint-position board)
     ],
 }
 
@@ -72,5 +76,11 @@ TINY_SLEEP = 5e-2
 
 WRIST_CALIBRATED = "wrist_calibrated"
 CALIBRATED = "calibrated"
+JOINT_SENSOR_RANGE_CALIBRATED = "joint_sensor_range_calibrated"
+JOINT_SENSOR_SIGN_CALIBRATED = "joint_sensor_sign_calibrated"
+JOINT_SENSOR_MAPPING_CALIBRATED = "joint_sensor_mapping_calibrated"
+JOINT_SENSOR_ZERO = "joint_sensor_zero"
+JOINT_SENSOR_SLOPE_SIGN = "joint_sensor_slope_sign"
+JOINT_SENSOR_RANGE = "joint_sensor_range"
 NUM_STEPS = 50
 STEP_SIZE = 0.01

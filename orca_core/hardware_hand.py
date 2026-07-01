@@ -24,7 +24,19 @@ from .hardware.dynamixel_client import DynamixelClient
 from .hardware.feetech_client import FeetechClient
 from .hardware.mock_tactile_client import MockTactileClient
 from .hardware.motor_client import MotorClient
-from .hardware.sensing.types import ResultantReading, TactileReading, TaxelReading
+from .hardware.sensing.constants import DEFAULT_JOINT_SENSOR_PORT
+from .hardware.sensing.joint_sensor_client import (
+    JointSensorClient,
+    map_angles_to_joints,
+    pick_changed_channel,
+    required_slope_sign,
+)
+from .hardware.sensing.types import (
+    JointSensorReading,
+    ResultantReading,
+    TactileReading,
+    TaxelReading,
+)
 from .hardware.tactile_client import TactileClient
 from .utils.utils import (
     auto_detect_port,
@@ -49,8 +61,13 @@ from .constants import (
     TINY_SLEEP,
     JOINT_TO_MOTOR_RATIOS,
     MOTOR_LIMITS_DICT,
+    JOINT_SENSOR_RANGE,
     WRIST_CALIBRATED,
     CALIBRATED,
+    JOINT_SENSOR_RANGE_CALIBRATED,
+    JOINT_SENSOR_ZERO,
+    JOINT_SENSOR_SLOPE_SIGN,
+    JOINT_SENSOR_RANGE,
     NUM_STEPS,
     POSITION,
     STEP_SIZE,
@@ -101,6 +118,7 @@ class OrcaHand(BaseHand):
         self._wrap_offsets_dict: Dict[int, float] = None
         self._motor_client: MotorClient = None
         self._motor_lock: RLock = RLock()
+        self._joint_sensor_client: JointSensorClient = None
 
         self._task_thread: threading.Thread = None
         self._task_stop_event = threading.Event()
@@ -282,6 +300,7 @@ class OrcaHand(BaseHand):
         Returns:
             A ``(success, message)`` tuple.
         """
+        self._disconnect_joint_sensors()
         try:
             if self._motor_client is None:
                 return True, "Disconnected successfully"
@@ -482,6 +501,456 @@ class OrcaHand(BaseHand):
         self._set_motor_pos(motor_pos)
         return True
 
+    def _set_joint_current(self, joint_current: OrcaJointPositions) -> bool:
+        motor_current = self._joint_to_motor_current(joint_current.as_dict())
+        self._set_motor_current(motor_current)
+        return True
+
+    # ------------------------------------------------------------------
+    # Joint-position sensing (magnetic-encoder board)
+    # ------------------------------------------------------------------
+
+    def connect_joint_sensors(self, start_stream: bool = True) -> tuple[bool, str]:
+        """Connect to the magnetic-encoder joint-position board.
+
+        Tries the configured ``joint_sensors.port`` first, then USB-VID
+        auto-detection for the Teensy board. Independent of the motor bus, so it
+        can be used on an unpowered hand for sensor bring-up.
+
+        Args:
+            start_stream: Start the background reader so
+                :meth:`get_sensed_joint_positions` returns the freshest frame
+                without blocking (default ``True``).
+
+        Returns:
+            A ``(success, message)`` tuple.
+        """
+        configured_port = self.config.joint_sensor_port or DEFAULT_JOINT_SENSOR_PORT
+        candidate_ports = [configured_port]
+        detected = auto_detect_port("joint_sensor")
+        if detected and detected not in candidate_ports:
+            candidate_ports.append(detected)
+
+        last_error = ""
+        for port in candidate_ports:
+            try:
+                client = JointSensorClient(
+                    port=port,
+                    baudrate=self.config.joint_sensor_baudrate,
+                    params_dir=self.config.joint_sensor_params_dir,
+                )
+                client.connect()
+                self._joint_sensor_client = client
+                zeros = self._apply_joint_sensor_zero()
+                signs = self._apply_joint_sensor_slope_sign()
+                if start_stream:
+                    client.start_stream()
+                applied = []
+                if zeros:
+                    applied.append(f"{zeros} zero offsets")
+                if signs:
+                    applied.append(f"{signs} slope signs")
+                suffix = f" ({', '.join(applied)} applied)" if applied else ""
+
+                if not self.calibration.joint_sensor_range_calibrated :
+                    print(f"\033[93mWarning: Joint sensor range has not been calibrated.\033[0m")
+
+                return True, f"Joint sensor connected on {port}{suffix}"
+            except Exception as e:
+                last_error = f"{port}: {e}"
+                print(f"Joint sensor connection failed on {last_error}")
+
+        self._joint_sensor_client = None
+        return False, (
+            "Joint sensor connection failed: no usable port "
+            f"(set joint_sensors.port in config.yaml or check the board is plugged in). "
+            f"Last error: {last_error}"
+        )
+
+    def _disconnect_joint_sensors(self) -> None:
+        if self._joint_sensor_client is not None:
+            try:
+                self._joint_sensor_client.disconnect()
+            except Exception:
+                pass
+            self._joint_sensor_client = None
+
+    def _apply_joint_sensor_zero(self) -> int:
+        """Override the sensors' ``voltage_at_zero`` from ``calibration.yaml``.
+
+        Reads the ``joint_sensor_zero`` block (joint name → captured voltage),
+        maps each joint to its encoder channel via ``joint_to_sensor_id``, and
+        pushes the overrides onto the live client. Returns the number of joints
+        applied.
+        """
+        if self._joint_sensor_client is None:
+            return 0
+        calibration = read_yaml(self.config.calibration_path) or {}
+        zero_by_joint = calibration.get(JOINT_SENSOR_ZERO, {}) or {}
+        overrides = {
+            self.config.joint_to_sensor_id[joint]: float(voltage)
+            for joint, voltage in zero_by_joint.items()
+            if joint in self.config.joint_to_sensor_id
+        }
+        if overrides:
+            self._joint_sensor_client.set_voltage_at_zero(overrides)
+        return len(overrides)
+
+    def _apply_joint_sensor_slope_sign(self) -> int:
+        """Force each sensor's ``slope`` sign from ``calibration.yaml``.
+
+        Reads the ``joint_sensor_slope_sign`` block (joint name → ``+1``/``-1``),
+        maps each joint to its channel, and flips the slope sign while keeping
+        the CSV magnitude. Returns the number of joints applied.
+        """
+        if self._joint_sensor_client is None:
+            return 0
+        calibration = read_yaml(self.config.calibration_path) or {}
+        sign_by_joint = calibration.get(JOINT_SENSOR_SLOPE_SIGN, {}) or {}
+        overrides = {
+            self.config.joint_to_sensor_id[joint]: int(sign)
+            for joint, sign in sign_by_joint.items()
+            if joint in self.config.joint_to_sensor_id
+        }
+        if overrides:
+            self._joint_sensor_client.set_slope_sign(overrides)
+        return len(overrides)
+
+    def set_joint_sensor_slope_signs(
+        self, signs: Dict[str, int], persist: bool = True
+    ) -> Dict[str, int]:
+        """Apply (and optionally persist) per-joint encoder slope signs.
+
+        Flips the slope sign of the mapped channels so the sensed angle runs in
+        the same direction as the actual joint angle; the magnitude stays from
+        the CSV. Typically fed the ``slope_sign`` values from
+        :meth:`discover_joint_sensor_map`.
+
+        Args:
+            signs: Mapping of joint name → ``+1``/``-1``. ``None`` values and
+                joints with no channel mapping are skipped.
+            persist: When ``True``, also write the signs to ``calibration.yaml``.
+
+        Returns:
+            The mapping that was actually applied (joint → sign).
+        """
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        applied = {
+            joint: int(sign)
+            for joint, sign in signs.items()
+            if sign in (1, -1) and joint in self.config.joint_to_sensor_id
+        }
+        self._joint_sensor_client.set_slope_sign(
+            {self.config.joint_to_sensor_id[j]: s for j, s in applied.items()}
+        )
+        if persist and applied:
+            calibration = read_yaml(self.config.calibration_path) or {}
+            merged = dict(calibration.get(JOINT_SENSOR_SLOPE_SIGN, {}) or {})
+            merged.update(applied)
+            update_yaml(self.config.calibration_path, JOINT_SENSOR_SLOPE_SIGN, merged)
+        return applied
+
+    def calibrate_joint_sensor_zero(self, num_samples: int = 200) -> Dict[str, float]:
+        """Capture the current pose as the joint-sensor zero and persist it.
+
+        Hold the hand at the all-joints-zero pose (e.g. matching the MuJoCo
+        reference), then call this. The per-channel voltage is averaged over
+        ``num_samples`` frames and written to ``calibration.yaml`` under
+        ``joint_sensor_zero`` (joint name → voltage), and applied live so
+        subsequent readings of these joints read ~0 at this pose.
+
+        Args:
+            num_samples: Frames to average for a stable capture.
+
+        Returns:
+            Mapping of joint name → captured ``voltage_at_zero`` (V).
+
+        Raises:
+            RuntimeError: If the joint sensor is not connected.
+            ValueError: If no ``joint_to_sensor_id`` mapping is configured.
+        """
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        if not self.config.joint_to_sensor_id:
+            raise ValueError(
+                "No joint_to_sensor_id mapping configured; cannot map channels to joints."
+            )
+
+        voltages = self._joint_sensor_client.capture_zero_voltages(num_samples)
+        zero_by_joint = {
+            joint: float(voltages[channel])
+            for joint, channel in self.config.joint_to_sensor_id.items()
+            if channel < len(voltages)
+        }
+
+        # Merge with any existing block so unrelated joints are preserved.
+        calibration = read_yaml(self.config.calibration_path) or {}
+        merged = dict(calibration.get(JOINT_SENSOR_ZERO, {}) or {})
+        merged.update(zero_by_joint)
+        update_yaml(self.config.calibration_path, JOINT_SENSOR_ZERO, merged)
+
+        # Apply live so the new zero takes effect immediately.
+        self._joint_sensor_client.set_voltage_at_zero(
+            {self.config.joint_to_sensor_id[j]: v for j, v in zero_by_joint.items()}
+        )
+        return zero_by_joint
+
+    def calibrate_joint_sensor_range(
+        self, duration: float = 30.0, poll_hz: float = 30.0
+    ) -> Dict[str, List[float]]:
+        """Record each joint's sensed-angle range while it is moved by hand.
+
+        Move every joint through its full range of motion during the capture
+        window. The per-joint min/max of :meth:`get_sensed_joint_positions` is
+        tracked and written to ``calibration.yaml`` under ``joint_sensor_range``
+        (joint name → ``[min, max]`` in degrees). Run this after the mapping,
+        slope-sign, and zero calibrations so the sensed angles are in their
+        final convention; the range then relates the sensed angle to the joint
+        ROM.
+
+        Args:
+            duration: Seconds to record.
+            poll_hz: Sensor polling rate during the capture.
+
+        Returns:
+            Mapping of joint name → ``[min, max]`` sensed angle (deg).
+
+        Raises:
+            RuntimeError: If the joint sensor is not connected.
+            ValueError: If no ``joint_to_sensor_id`` mapping is configured.
+        """
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        if not self.config.joint_to_sensor_id:
+            raise ValueError(
+                "No joint_to_sensor_id mapping configured; cannot map channels to joints."
+            )
+
+        mins: Dict[str, float] = {}
+        maxs: Dict[str, float] = {}
+        period = 1.0 / poll_hz if poll_hz > 0 else 0.0
+        end = time.time() + duration
+        while time.time() < end:
+            sensed = self.get_sensed_joint_positions().as_dict()
+            for joint, angle in sensed.items():
+                if angle is None:
+                    continue
+                angle = float(angle)
+                mins[joint] = angle if joint not in mins else min(mins[joint], angle)
+                maxs[joint] = angle if joint not in maxs else max(maxs[joint], angle)
+            if period:
+                time.sleep(period)
+
+        ranges = {joint: [mins[joint], maxs[joint]] for joint in mins}
+
+        # Merge with any existing block so unrelated joints are preserved.
+        calibration = read_yaml(self.config.calibration_path) or {}
+        merged = dict(calibration.get(JOINT_SENSOR_RANGE, {}) or {})
+        merged.update(ranges)
+        update_yaml(self.config.calibration_path, JOINT_SENSOR_RANGE, merged)
+        return ranges
+
+    def get_sensed_joint_voltages(self) -> List[float]:
+        """Return the raw per-channel encoder voltages (V), ordered by sensor id."""
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        return self._joint_sensor_client.read_voltages()
+
+    def discover_joint_sensor_map(
+        self,
+        joints: List[str] | None = None,
+        motor_delta: float = 0.5,
+        settle_time: float = 0.5,
+        num_samples: int = 30,
+        threshold: float = 0.05,
+        probe_current: int | None = None,
+    ) -> Dict[str, dict]:
+        """Discover which encoder channel each joint drives by actuating it.
+
+        For every joint, nudges its motor a little in each direction, averages
+        the per-channel voltage before and after, and attributes the joint to
+        the channel that changed the most. This builds the
+        ``joint_to_sensor_id`` mapping empirically instead of by hand.
+
+        The hand must have motors connected and the joint sensor connected. The
+        control mode / max current are set for a gentle, compliant probe and
+        restored afterwards. Each motor is returned to its starting position.
+
+        Args:
+            joints: Joints to probe (defaults to all joints that have a motor).
+            motor_delta: Relative motor move per probe (rad).
+            settle_time: Seconds to wait after a move before sampling.
+            num_samples: Voltage frames to average per sample.
+            threshold: Minimum voltage change (V) to accept a channel.
+            probe_current: Max current (mA) during probing
+                (defaults to ``calibration_current``).
+
+        Returns:
+            ``{joint: {"channel": int|None, "delta": float, "runner_up": float}}``.
+            ``channel`` is ``None`` when no channel changed above *threshold*.
+
+        Raises:
+            RuntimeError: If motors or the joint sensor are not connected.
+        """
+        if not self.is_connected():
+            raise RuntimeError("Motors are not connected; call connect() first.")
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+
+        if joints is None:
+            joints = [j for j in self.config.joint_ids if j in self.config.joint_to_motor_map]
+
+        prev_mode = self.config.control_mode
+        self.set_control_mode(CURRENT_BASED_POSITION)
+        self.set_max_current(probe_current or self.config.calibration_current)
+        self.enable_torque()
+
+        results: Dict[str, dict] = {}
+        try:
+            for joint in joints:
+                motor_id = self.config.joint_to_motor_map.get(joint)
+                if motor_id is None:
+                    continue
+
+                baseline = self._joint_sensor_client.average_voltages(num_samples)
+                # Reference for the *actual* joint direction: the motor-derived
+                # joint angle (joint_to_motor mapping is direction-correct).
+                joint_base = self.get_joint_position().as_dict().get(joint)
+                best: dict | None = None
+
+                # Probe both directions; a joint at one limit still responds to
+                # the opposite move. Always return to the starting position.
+                for sign in (1.0, -1.0):
+                    self._set_motor_pos(
+                        {motor_id: sign * motor_delta}, rel_to_current=True
+                    )
+                    time.sleep(settle_time)
+                    moved = self._joint_sensor_client.average_voltages(num_samples)
+                    joint_moved = self.get_joint_position().as_dict().get(joint)
+                    self._set_motor_pos(
+                        {motor_id: -sign * motor_delta}, rel_to_current=True
+                    )
+                    time.sleep(settle_time)
+
+                    channel, delta, runner_up = pick_changed_channel(
+                        baseline, moved, threshold
+                    )
+                    if channel is not None and (best is None or delta > best["delta"]):
+                        delta_voltage = moved[channel] - baseline[channel]
+                        delta_joint = (
+                            joint_moved - joint_base
+                            if joint_base is not None and joint_moved is not None
+                            else None
+                        )
+                        best = {
+                            "channel": channel,
+                            "delta": float(delta),
+                            "runner_up": float(runner_up),
+                            "slope_sign": required_slope_sign(delta_joint, delta_voltage),
+                        }
+
+                results[joint] = best or {
+                    "channel": None,
+                    "delta": 0.0,
+                    "runner_up": 0.0,
+                    "slope_sign": None,
+                }
+                r = results[joint]
+                if r["channel"] is not None:
+                    sign_txt = (
+                        f", slope sign {r['slope_sign']:+d}"
+                        if r["slope_sign"] is not None
+                        else ", slope sign unknown (calibrate motors first)"
+                    )
+                    print(
+                        f"  {joint:<12} -> channel {r['channel']} "
+                        f"(Δ={r['delta']:.3f} V, runner-up Δ={r['runner_up']:.3f} V"
+                        f"{sign_txt})"
+                    )
+                else:
+                    print(f"  {joint:<12} -> no clear channel")
+        finally:
+            self.set_control_mode(prev_mode)
+            self.set_max_current(self.config.max_current)
+
+        return results
+
+    def _read_sensed_angles(self) -> List[float]:
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        angles, _ = self._joint_sensor_client.get_latest()
+        if angles is None:
+            # No background stream running (or no frame yet) — read synchronously.
+            angles = self._joint_sensor_client.read_angles()
+        return angles
+
+    def get_sensed_joint_angles(self) -> List[float]:
+        """Return the raw per-channel joint angles (degrees), ordered by sensor id."""
+        return self._read_sensed_angles()
+
+    def get_sensed_joint_positions(self) -> OrcaJointPositions:
+        """Return measured joint positions from the encoder board.
+
+        Maps sensor channels to joint names via ``joint_sensors.joint_to_sensor_id``
+        from ``config.yaml``. Angles are in degrees, matching the joint ROM units.
+
+        Raises:
+            ValueError: If no ``joint_to_sensor_id`` mapping is configured.
+        """
+        if not self.config.joint_to_sensor_id:
+            raise ValueError(
+                "No joint_to_sensor_id mapping configured. Add a "
+                "joint_sensors.joint_to_sensor_id block to config.yaml, or use "
+                "get_sensed_joint_angles() for the raw per-channel readings."
+            )
+        angles = self._read_sensed_angles()
+        joint_angles = map_angles_to_joints(angles, self.config.joint_to_sensor_id)
+        return OrcaJointPositions.from_dict(joint_angles)
+
+    def get_sensed_joint_data(self) -> JointSensorReading | None:
+        """Return a :class:`JointSensorReading` (mapped + raw angles), or ``None``.
+
+        ``None`` is returned only when a background stream is running but no
+        frame has arrived yet.
+        """
+        if self._joint_sensor_client is None or not self._joint_sensor_client.is_connected:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        angles, ts = self._joint_sensor_client.get_latest()
+        if angles is None:
+            angles, ts = self._joint_sensor_client.read_angles(), time.time()
+        if angles is None:
+            return None
+        joint_angles = map_angles_to_joints(angles, self.config.joint_to_sensor_id)
+        return JointSensorReading(angles=joint_angles, raw=list(angles), timestamp=ts)
+
+    def start_joint_sensor_stream(self) -> None:
+        """Start the background reader for the joint-position board."""
+        if self._joint_sensor_client is None:
+            raise RuntimeError(
+                "Joint sensor is not connected; call connect_joint_sensors() first."
+            )
+        self._joint_sensor_client.start_stream()
+
+    def stop_joint_sensor_stream(self) -> None:
+        """Stop the background reader for the joint-position board."""
+        if self._joint_sensor_client is not None:
+            self._joint_sensor_client.stop_stream()
+
     def init_joints(self, force_calibrate: bool = False, move_to_neutral: bool = True):
         """Prepare the hand for operation.
 
@@ -565,6 +1034,7 @@ class OrcaHand(BaseHand):
         blocking: bool = True,
         force_wrist: bool = False,
         joints: list | None = None,
+        calibrate_joint_sensors: bool = True
     ):
         """Run the joint calibration routine.
 
@@ -579,22 +1049,23 @@ class OrcaHand(BaseHand):
             joints: When given, only calibrate steps that touch any of these
                 joint names (others are skipped). Useful for re-running just
                 one finger or joint without re-calibrating the whole hand.
-
+            calibrate_joint_sensors: Whether to calibrate the joint sensors.
         On completion ``self.calibration`` is replaced with a fresh
         :class:`~orca_core.CalibrationResult`. Partial progress is written to
         disk after every step so an interrupted run is never fully lost.
         """
         if blocking:
             self._task_stop_event.clear()
-            result = self._calibrate(force_wrist=force_wrist, joints=joints)
+            result = self._calibrate(force_wrist=force_wrist, joints=joints, calibrate_joint_sensors=calibrate_joint_sensors)
             if result is not None:
                 self.calibration = result
         else:
-            self._start_task(self._calibrate_and_apply, force_wrist=force_wrist, joints=joints)
+            self._start_task(self._calibrate_and_apply, force_wrist=force_wrist, joints=joints, calibrate_joint_sensors=calibrate_joint_sensors)
 
     def _build_calibration_result(
         self,
         motor_limits: Dict[int, list],
+        joint_sensor_limits: Dict[int, list],
         joint_to_motor_ratios: Dict[int, float],
         wrist_calibrated: bool,
     ) -> CalibrationResult:
@@ -610,6 +1081,10 @@ class OrcaHand(BaseHand):
             motor_limits_dict={
                 motor_id: list(limits) for motor_id, limits in motor_limits.items()
             },
+            joint_sensor_limits_dict={
+                motor_id: list(limits)
+                for motor_id, limits in joint_sensor_limits.items()
+            },
             joint_to_motor_ratios_dict=dict(joint_to_motor_ratios),
             calibrated=calibrated,
             wrist_calibrated=wrist_calibrated,
@@ -619,6 +1094,7 @@ class OrcaHand(BaseHand):
         self,
         force_wrist: bool = False,
         joints: list | None = None,
+        calibrate_joint_sensors: bool = True
     ) -> CalibrationResult | None:
         """Execute the calibration routine and return a :class:`~orca_core.CalibrationResult`.
 
@@ -680,8 +1156,15 @@ class OrcaHand(BaseHand):
             motor_id: list(limits)
             for motor_id, limits in self.calibration.motor_limits_dict.items()
         }
+        joint_sensor_limits = {
+            motor_id: list(limits)
+            for motor_id, limits in self.calibration.motor_limits_dict.items()
+        }
         pending_limits: Dict[int, list] = {
             motor_id: [None, None] for motor_id in self.config.motor_ids
+        }
+        pending_joint_sensor_limits: Dict[int, list] = {
+            joint: [None, None] for joint in self.config.motor_ids
         }
         joint_to_motor_ratios = dict(self.calibration.joint_to_motor_ratios_dict)
 
@@ -702,12 +1185,11 @@ class OrcaHand(BaseHand):
             if self._task_stop_event.is_set():
                 return None
 
-            desired_increment, motor_reached_limit, directions = {}, {}, {}
-            position_buffers, calibrated_joints, position_logs, current_log = (
-                {},
-                {},
-                {},
-                {},
+            desired_increment, motor_reached_limit, directions, joint_sensor_motor_inverse = (
+                {}, {}, {}, {}
+            )
+            position_buffers, joint_sensor_buffers, calibrated_joints, position_logs, current_log = (
+                {}, {}, {}, {}, {}
             )
 
             for joint, direction in step[JOINTS].items():
@@ -732,8 +1214,15 @@ class OrcaHand(BaseHand):
                     sign = -sign
 
                 directions[motor_id] = sign
+                if calibrate_joint_sensors :
+                    joint_sensor_motor_inverse[motor_id] = 1 if self._joint_sensor_client.get_slope()[
+                        self.config.joint_to_sensor_id[joint]
+                    ] > 0 else -1
                 self._wrap_offsets_dict[motor_id] = 0.0
                 position_buffers[motor_id] = deque(
+                    maxlen=self.config.calibration_num_stable
+                )
+                joint_sensor_buffers[motor_id] = deque(
                     maxlen=self.config.calibration_num_stable
                 )
                 position_logs[motor_id] = []
@@ -762,6 +1251,8 @@ class OrcaHand(BaseHand):
                 time.sleep(self.config.calibration_step_period)
                 curr_pos = self.get_motor_pos()
                 curr_current = self.get_motor_current()
+                if calibrate_joint_sensors :
+                    curr_joint_sensor_pos = self.get_sensed_joint_positions().as_dict()
 
                 for motor_id in desired_increment.keys():
                     if not motor_reached_limit[motor_id]:
@@ -769,6 +1260,13 @@ class OrcaHand(BaseHand):
                         position_buffers[motor_id].append(curr_pos[idx])
                         position_logs[motor_id].append(float(curr_pos[idx]))
                         current_log[motor_id].append(float(curr_current[idx]))
+                        if calibrate_joint_sensors :
+                            if WRIST in self.config.motor_to_joint_dict[motor_id]:
+                                joint_sensor_buffers[motor_id].append(0)
+                            else :
+                                joint_sensor_buffers[motor_id].append(
+                                    float(curr_joint_sensor_pos[self.config.motor_to_joint_dict[motor_id]])
+                                )
 
                         if len(
                             position_buffers[motor_id]
@@ -780,17 +1278,30 @@ class OrcaHand(BaseHand):
                             motor_reached_limit[motor_id] = True
                             if WRIST in self.config.motor_to_joint_dict[motor_id]:
                                 avg_limit = float(np.mean(position_buffers[motor_id]))
+                                if calibrate_joint_sensors:
+                                    avg_joint_sensor_limit = float(np.mean(joint_sensor_buffers[motor_id]))
                             else:
                                 self.disable_torque([motor_id])
                                 time.sleep(TINY_SLEEP)
                                 avg_limit = float(self.get_motor_pos()[idx])
+                                if calibrate_joint_sensors:
+                                    avg_joint_sensor_limit = float(
+                                        self.get_sensed_joint_positions().as_dict()[self.config.motor_to_joint_dict[motor_id]]
+                                    )
+
                             print(
                                 f"Motor {motor_id} corresponding to joint {self.config.motor_to_joint_dict[motor_id]} reached the limit at {avg_limit} rad."
                             )
                             if directions[motor_id] == 1:
                                 pending_limits[motor_id][1] = avg_limit
-                            if directions[motor_id] == -1:
+                            elif directions[motor_id] == -1:
                                 pending_limits[motor_id][0] = avg_limit
+
+                            if calibrate_joint_sensors :
+                                if directions[motor_id] * joint_sensor_motor_inverse[motor_id] == 1:
+                                    pending_joint_sensor_limits[motor_id][1] = avg_joint_sensor_limit
+                                elif directions[motor_id] * joint_sensor_motor_inverse[motor_id] == -1:
+                                    pending_joint_sensor_limits[motor_id][0] = avg_joint_sensor_limit
 
                             if (
                                 self._motor_client.requires_offset_calibration
@@ -825,6 +1336,9 @@ class OrcaHand(BaseHand):
 
                 # Both directions measured — commit to motor_limits.
                 motor_limits[motor_id] = list(pending_limits[motor_id])
+                if calibrate_joint_sensors :
+                    joint_sensor_limits[motor_id] = list(pending_joint_sensor_limits[motor_id])
+
                 delta_motor = motor_limits[motor_id][1] - motor_limits[motor_id][0]
                 delta_joint = (
                     self.config.joint_roms_dict[joint][1]
@@ -842,12 +1356,19 @@ class OrcaHand(BaseHand):
                 joint_to_motor_ratios,
             )
             update_yaml(self.config.calibration_path, MOTOR_LIMITS_DICT, motor_limits)
+            if calibrate_joint_sensors :
+                update_yaml(
+                    self.config.calibration_path,
+                    JOINT_SENSOR_RANGE,
+                    joint_sensor_limits,
+                )
 
             step_wrist_calibrated = self.calibration.wrist_calibrated or (
                 WRIST in calibrated_joints
             )
             self.calibration = self._build_calibration_result(
                 motor_limits=motor_limits,
+                joint_sensor_limits=joint_sensor_limits,
                 joint_to_motor_ratios=joint_to_motor_ratios,
                 wrist_calibrated=step_wrist_calibrated,
             )
@@ -861,6 +1382,12 @@ class OrcaHand(BaseHand):
                 CALIBRATED,
                 self.calibration.calibrated,
             )
+            if calibrate_joint_sensors :
+                update_yaml(
+                    self.config.calibration_path,
+                    JOINT_SENSOR_RANGE_CALIBRATED,
+                    True
+                )
 
             if calibrated_joints:
                 self.set_joint_positions(
@@ -877,6 +1404,7 @@ class OrcaHand(BaseHand):
 
         final_result = self._build_calibration_result(
             motor_limits=motor_limits,
+            joint_sensor_limits=joint_sensor_limits,
             joint_to_motor_ratios=joint_to_motor_ratios,
             wrist_calibrated=new_wrist_calibrated,
         )
@@ -1005,6 +1533,81 @@ class OrcaHand(BaseHand):
                 raise ValueError("desired_pos must be a dict, np.ndarray, or list.")
 
             self._motor_client.write_desired_pos(motor_ids_to_write, positions_to_write)
+
+    def _set_motor_current(
+        self, desired_current: Union[dict, np.ndarray, list]
+    ):
+        with self._motor_lock:
+
+            motor_ids_to_write = []
+            positions_to_write = []
+
+            if isinstance(desired_current, dict):
+                for motor_id, current_val in desired_current.items():
+                    if motor_id not in self.config.motor_ids:
+                        print(
+                            f"Warning: Motor ID {motor_id} in desired_current dict is not in self.config.motor_ids. Skipping."
+                        )
+                        continue
+                    if current_val is None or math.isnan(current_val):
+                        continue
+
+                    current_to_write = float(current_val)
+
+                    motor_ids_to_write.append(motor_id)
+                    positions_to_write.append(current_to_write)
+
+                if not motor_ids_to_write:
+                    return
+                positions_to_write = np.array(positions_to_write, dtype=float)
+
+            elif isinstance(desired_current, (np.ndarray, list)):
+                if len(desired_current) != len(self.config.motor_ids):
+                    raise ValueError(
+                        f"Length of desired_current (list/ndarray) ({len(desired_current)}) must match the number of configured motor_ids ({len(self.config.motor_ids)})."
+                    )
+
+                for idx, current_val in enumerate(desired_current):
+                    if current_val is None or math.isnan(current_val):
+                        continue
+
+                    motor_ids_to_write.append(self.config.motor_ids[idx])
+                    positions_to_write.append(float(current_val))
+
+                if not motor_ids_to_write:
+                    print(
+                        "\033[93mWarning: All currents in desired_current (list/array) were None. No motor commands sent.\033[0m"
+                    )
+                    return
+
+                positions_to_write = np.array(positions_to_write, dtype=float)
+
+            else:
+                raise ValueError("desired_current must be a dict, np.ndarray, or list.")
+
+            self._motor_client.write_desired_current(motor_ids_to_write, positions_to_write)
+    
+    def _joint_to_motor_current(self, joint_current: dict) -> np.ndarray:
+        motor_current = [None] * len(self.config.motor_ids)
+
+        for joint_name, current in joint_current.items():
+            motor_id = self.config.joint_to_motor_map.get(joint_name)
+            if motor_id is None:
+                continue
+
+            idx = self.config.motor_id_to_idx_dict[motor_id]
+            if current is None:
+                motor_current[idx] = None
+                continue
+
+            # Joint currents are motor-space (mA); unlike positions they are not
+            # scaled by the transmission ratio. Only the direction is calibrated:
+            # positive current drives the joint in its positive direction, which
+            # for inverted joints means the opposite motor direction.
+            sign = -1.0 if self.config.joint_inversion_dict.get(joint_name, False) else 1.0
+            motor_current[idx] = float(current) * sign
+
+        return motor_current
 
     def _motor_to_joint_pos(self, motor_pos: np.ndarray) -> dict:
         if self._wrap_offsets_dict is None:

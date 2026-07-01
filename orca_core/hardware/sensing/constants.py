@@ -18,6 +18,43 @@ DEFAULT_FINGER_TO_SENSOR_ID = {
     "thumb": 0, "index": 1, "middle": 2, "ring": 3, "pinky": 4,
 }
 
+# ---------------------------------------------------------------------------
+# Joint-position (magnetic-encoder) sensor defaults
+# ---------------------------------------------------------------------------
+# The Teensy-based joint-angle board streams 16 magnetic-encoder channels over
+# USB serial at 2 Mbps. Processing reuses the pure-python ``SensorReader`` from
+# ``third_party/orca_sensor`` so calibration stays in one place.
+
+DEFAULT_JOINT_SENSOR_PORT = "/dev/ttyACM0"
+DEFAULT_JOINT_SENSOR_BAUDRATE = 2_000_000
+NUM_JOINT_SENSORS = 16
+
+# Maps each joint name to the encoder channel (0..NUM_JOINT_SENSORS-1) that
+# measures it. This is the template for the ``joint_sensors.joint_to_sensor_id``
+# block in a hand's ``config.yaml`` — fill in the channel index that each joint
+# is physically wired to. The v2 hand has 17 joints but only 16 encoder
+# channels: ``wrist`` is driven by its own motor and is not sensed here, leaving
+# exactly the 16 finger joints below. Channel ids must be unique and within
+# ``[0, NUM_JOINT_SENSORS)``.
+DEFAULT_JOINT_TO_SENSOR_ID: dict[str, int] = {
+    "thumb_cmc": 0,
+    "thumb_abd": 1,
+    "thumb_mcp": 2,
+    "thumb_dip": 3,
+    "index_abd": 4,
+    "index_mcp": 5,
+    "index_pip": 6,
+    "middle_abd": 7,
+    "middle_mcp": 8,
+    "middle_pip": 9,
+    "ring_abd": 10,
+    "ring_mcp": 11,
+    "ring_pip": 12,
+    "pinky_abd": 13,
+    "pinky_mcp": 14,
+    "pinky_pip": 15,
+}
+
 # Default taxel counts per finger (must match sensor model configs)
 DEFAULT_TAXEL_COUNTS = {
     "thumb": 51, "index": 87, "middle": 87, "ring": 87, "pinky": 51,

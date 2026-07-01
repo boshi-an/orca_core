@@ -17,6 +17,7 @@ from .constants import (
     JOINT_IDS,
     JOINT_ROM_DICT,
     JOINT_TO_MOTOR_MAP,
+    JOINT_CURRENT_DICT,
     MOTOR_IDS,
     SUPPORTED_MOTOR_TYPES,
 )
@@ -26,6 +27,9 @@ from .hardware.sensing.constants import (
     DEFAULT_SENSOR_PORT,
     DEFAULT_SENSOR_BAUDRATE,
     DEFAULT_FINGER_TO_SENSOR_ID,
+    DEFAULT_JOINT_SENSOR_BAUDRATE,
+    DEFAULT_JOINT_TO_SENSOR_ID,
+    NUM_JOINT_SENSORS,
 )
 from .joint_position import OrcaJointPositions
 from .utils.utils import get_model_path, read_yaml
@@ -112,6 +116,7 @@ class BaseHandConfig:
     type: Literal["left", "right"] | None = None
     joint_ids: List[str] = field(default_factory=list)
     joint_roms_dict: Dict[str, List[float]] = field(default_factory=dict)
+    joint_current_dict: Dict[str, List[float]] = field(default_factory=dict)
     neutral_position: Dict[str, float] = field(default_factory=dict)
 
     @property
@@ -141,6 +146,8 @@ class BaseHandConfig:
             kwargs["joint_ids"] = list(config[JOINT_IDS])
         if JOINT_ROM_DICT in config:
             kwargs["joint_roms_dict"] = dict(config[JOINT_ROM_DICT])
+        if JOINT_CURRENT_DICT in config:
+            kwargs["joint_current_dict"] = dict(config[JOINT_CURRENT_DICT])
         if "neutral_position" in config:
             kwargs["neutral_position"] = dict(config["neutral_position"])
 
@@ -183,13 +190,42 @@ class BaseHandConfig:
                 raise HandConfigValidationError(
                     f"Joint {joint} is not defined among the hand's joint IDs: {self.joint_ids}"
                 )
-            normalized[joint] = self._clamp_joint_value(joint, pos)
+            normalized[joint] = self._clamp_joint_pos_value(joint, pos)
 
         return OrcaJointPositions.from_dict(normalized)
 
-    def _clamp_joint_value(self, joint_name: str, joint_pos: float) -> float:
+    def _clamp_joint_pos_value(self, joint_name: str, joint_pos: float) -> float:
         min_pos, max_pos = self.joint_roms_dict[joint_name]
         return max(min_pos, min(max_pos, float(joint_pos)))
+
+    def clamp_joint_currents(
+        self,
+        joint_current: OrcaJointPositions,
+    ) -> OrcaJointPositions:
+        """Clamp joint currents to the configured ROM bounds."""
+        if not isinstance(joint_current, OrcaJointPositions):
+            raise HandConfigValidationError(
+                "joint_current must be an OrcaJointPositions instance."
+            )
+
+        normalized = {}
+        for joint, current in joint_current:
+            if joint not in self.joint_ids:
+                raise HandConfigValidationError(
+                    f"Joint {joint} is not defined among the hand's joint IDs: {self.joint_ids}"
+                )
+            normalized[joint] = self._clamp_joint_current_value(joint, current)
+
+        return OrcaJointPositions.from_dict(normalized)
+
+    def _clamp_joint_current_value(self, joint_name: str, joint_current: float) -> float:
+        limits = self.joint_current_dict.get(joint_name)
+        if limits is None:
+            # Fall back to a symmetric bound from the hand-wide current cap.
+            bound = float(getattr(self, "max_current", 0))
+            limits = (-bound, bound)
+        min_current, max_current = limits
+        return max(min_current, min(max_current, float(joint_current)))
 
 
 @dataclass(frozen=True)
@@ -212,6 +248,10 @@ class OrcaHandConfig(BaseHandConfig):
     calibration_threshold: float = 0.01  # rad
     calibration_num_stable: int = 20
     calibration_sequence: List[dict] = field(default_factory=list)
+    joint_sensor_port: Optional[str] = None
+    joint_sensor_baudrate: int = DEFAULT_JOINT_SENSOR_BAUDRATE
+    joint_sensor_params_dir: Optional[str] = None
+    joint_to_sensor_id: Dict[str, int] = field(default_factory=dict)
 
     @property
     def motor_id_to_idx_dict(self) -> Dict[int, int]:
@@ -251,6 +291,8 @@ class OrcaHandConfig(BaseHandConfig):
             kwargs["joint_ids"] = list(config[JOINT_IDS])
         if JOINT_ROM_DICT in config:
             kwargs["joint_roms_dict"] = dict(config[JOINT_ROM_DICT])
+        if JOINT_CURRENT_DICT in config:
+            kwargs["joint_current_dict"] = dict(config[JOINT_CURRENT_DICT])
         if "neutral_position" in config:
             kwargs["neutral_position"] = dict(config["neutral_position"])
         if "baudrate" in config:
@@ -287,6 +329,28 @@ class OrcaHandConfig(BaseHandConfig):
             kwargs["calibration_num_stable"] = int(config["calibration_num_stable"])
         if "calibration_sequence" in config:
             kwargs["calibration_sequence"] = list(config["calibration_sequence"])
+
+        joint_sensors = config.get("joint_sensors") or {}
+        if "port" in joint_sensors:
+            kwargs["joint_sensor_port"] = joint_sensors["port"]
+        if "baudrate" in joint_sensors:
+            kwargs["joint_sensor_baudrate"] = int(joint_sensors["baudrate"])
+        if "params_dir" in joint_sensors:
+            kwargs["joint_sensor_params_dir"] = joint_sensors["params_dir"]
+        if "joint_to_sensor_id" in joint_sensors:
+            kwargs["joint_to_sensor_id"] = {
+                str(joint): int(sensor_id)
+                for joint, sensor_id in joint_sensors["joint_to_sensor_id"].items()
+            }
+        else:
+            # Fall back to the template, keeping only joints this hand actually
+            # has so models with a different joint set (e.g. v1) stay valid.
+            hand_joints = set(kwargs.get("joint_ids", []))
+            kwargs["joint_to_sensor_id"] = {
+                joint: sensor_id
+                for joint, sensor_id in DEFAULT_JOINT_TO_SENSOR_ID.items()
+                if joint in hand_joints
+            }
 
         return cls(**kwargs)
 
@@ -340,7 +404,30 @@ class OrcaHandConfig(BaseHandConfig):
                         f"Invalid direction for joint {joint}."
                     )
 
+        seen_sensor_ids: set[int] = set()
+        for joint, sensor_id in self.joint_to_sensor_id.items():
+            if joint not in self.joint_ids:
+                raise HandConfigValidationError(
+                    f"Joint {joint} in joint_to_sensor_id is not defined."
+                )
+            if not 0 <= sensor_id < NUM_JOINT_SENSORS:
+                raise HandConfigValidationError(
+                    f"Sensor id {sensor_id} for joint {joint} is out of range "
+                    f"[0, {NUM_JOINT_SENSORS})."
+                )
+            if sensor_id in seen_sensor_ids:
+                raise HandConfigValidationError(
+                    f"Sensor id {sensor_id} is mapped to more than one joint."
+                )
+            seen_sensor_ids.add(sensor_id)
+
     def __post_init__(self) -> None:
+        # Joints without explicit current limits fall back to a symmetric bound
+        # derived from the hand-wide max_current, so every joint has a limit.
+        for joint in self.joint_ids:
+            self.joint_current_dict.setdefault(
+                joint, [-self.max_current, self.max_current]
+            )
         self.validate_config()
 
 
