@@ -1,6 +1,7 @@
 
 
 import argparse
+import sys
 
 from common import add_hand_arguments, connect_hand, create_hand, shutdown_hand
 
@@ -35,6 +36,11 @@ def main() -> int:
         help="Fingers to calibrate (e.g., --fingers thumb index pinky)",
     )
     parser.add_argument(
+        "--joint_sensor",
+        action="store_true",
+        help="Whether to calibrate the joint sensors (default: True). If False, only the motors are calibrated.",
+    )
+    parser.add_argument(
         "--joints",
         type=str,
         nargs="+",
@@ -61,7 +67,13 @@ def main() -> int:
     try:
         connect_hand(hand)
         print("Starting calibration...")
-        hand.calibrate(force_wrist=args.force_wrist, joints=joints)
+        if args.joint_sensor :
+            ok, msg = hand.connect_joint_sensors(start_stream=True)
+            print(msg)
+            if not ok:
+                hand.disconnect()
+                sys.exit(1)
+        hand.calibrate(force_wrist=args.force_wrist, joints=joints, calibrate_joint_sensors=args.joint_sensor)
         print("Calibration complete.")
         return 0
     finally:

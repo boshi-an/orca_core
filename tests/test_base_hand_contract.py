@@ -24,6 +24,10 @@ class DummyHand(BaseHand):
                 self.state[joint] = value
         return True
 
+    def _set_joint_current(self, joint_current: OrcaJointPositions) -> bool:
+        self.command_log.append(joint_current.as_dict())
+        return True
+
 
 @pytest.fixture
 def hand(tmp_path):
